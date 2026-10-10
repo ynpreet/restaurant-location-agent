@@ -1,0 +1,4 @@
+# requirements.txt — Restaurant Location Agent (Demo 2 of 4)
+
+# Intentionally empty: this demo is stdlib-only Python.
+# Nothing to install. Just run:  python3 demo.py
