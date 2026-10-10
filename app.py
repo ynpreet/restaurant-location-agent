@@ -1,489 +1,150 @@
 #!/usr/bin/env python3
-"""
-Restaurant Location Agent — localhost web UI (Demo 2 of 4, Agentic AI Workshop).
+"""Restaurant Location Agent -- localhost web UI (stdlib only).
 
-Starts a small, stdlib-only web server (http.server, no frameworks, no pip)
-so the demo can be shown live in Google Chrome:
-
-    python3 app.py
-    -> Open in Chrome: http://localhost:8003
-
-Endpoints:
-    GET /         the single-page UI (header + story, Run live demo button,
-                  agent-trace panel, results panel)
-    GET /api/run  runs `python3 demo.py` via subprocess and returns
-                  {"ok": true, "output": "<demo stdout>"} as JSON
-
-Fully offline, no API keys, stdlib only. Bind address is 127.0.0.1 so the
-server is reachable only from this machine.
-
-Port 8003 is the fixed port for this demo in the workshop series. If the
-port is already in use the server exits with a clear error instead of a
-bare traceback.
+Run:  python3 app.py   then open http://localhost:8003
+Serves a guided, personalized tour of demo.py (the tested artifact --
+demo.py is never modified here; it is only imported as a module and its
+canned subprocess run is unchanged).
 """
 
-import errno
+import contextlib
 import http.server
+import io
 import json
-import os
+import re
 import subprocess
 import sys
+import urllib.parse
+from pathlib import Path
 
 HOST = "127.0.0.1"
 PORT = 8003
+HERE = Path(__file__).resolve().parent
+DEMO_PY = HERE / "demo.py"
 
-# demo.py lives next to this file; run it from there so the UI works no
-# matter which directory app.py is started from.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, str(HERE))
+import demo as DEMO  # the tested artifact: imported, never modified
 
+COND_RE = re.compile(
+    r"(type 2 diabetes|type 1 diabetes|diabetes|hypertension|high blood pressure|"
+    r"kidney disease|ckd|heart disease|depression|asthma|arthritis|copd|hyperlipidemia)"
+)
 
-def run_demo():
-    """Run `python3 demo.py` in a subprocess; return a JSON-able dict."""
+def _capture_canned():
+    """Run the canned demo exactly as before (subprocess), capture stdout."""
+    proc = subprocess.run(
+        [sys.executable, str(DEMO_PY)],
+        cwd=str(HERE),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    return proc.stdout or proc.stderr
+
+def _capture_fn(fn, params):
+    buf = io.StringIO()
     try:
-        proc = subprocess.run(
-            [sys.executable, "demo.py"],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "demo.py timed out after 60 seconds."}
-    except Exception as exc:  # e.g. demo.py missing
-        return {"ok": False, "error": "Could not launch demo.py: %s" % exc}
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "error": "demo.py exited with code %d." % proc.returncode,
-            "output": proc.stdout,
-            "stderr": proc.stderr[-2000:],
-        }
-    return {"ok": True, "output": proc.stdout}
+        with contextlib.redirect_stdout(buf):
+            return fn(params)
+    except Exception as exc:  # never crash the page on a bad input
+        return "[web-ui] The personalized run hit an error and stopped safely.\n%s: %s" % (type(exc).__name__, exc)
 
+# ---- personalized run: input handling lives in app.py; demo.py untouched ----
+
+def run_custom(params):
+    cuisine = (params.get("cuisine") or "Chinese").strip() or "Chinese"
+    zipf = (params.get("zip") or "all").strip()
+    avoid = (params.get("strategy") or "near") == "avoid"
+    zips = DEMO.ZIPS  # the engine scores all areas so any spotlight ZIP is ranked against the rest
+    goal = f"I want to open a {cuisine} restaurant in Phoenix -- where exactly should I open it?"
+    memory = DEMO.seed_memory()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print("YOUR TURN -- " + goal)
+        print("Your ZIP spotlight: %s" % ("all 8 areas" if zipf in ("all", "") else zipf))
+        print("Strategy: %s" % ("avoid competition (blue-ocean)" if avoid else "near competitors (Hotelling rule)"))
+        print("Honesty notes: (1) the sample dataset's competitor counts track Chinese restaurants;")
+        print("for other cuisines the plan, tools, scoring and memory are fully real while competitor")
+        print("counts stay approximate. (2) The engine scores all 8 areas so your spotlight ZIP can")
+        print("be ranked against the rest.")
+        planner = DEMO.Planner()
+        tasks, note = planner.plan(goal, zips, memory, cuisine)
+        print()
+        print("PLANNER -- plan of action (%d steps)" % len(tasks))
+        for t in tasks:
+            print("  Step %2d. %-44s [tool: %s]" % (t.step, t.description, t.tool))
+        print()
+        print("MEMORY -- %s" % note)
+        print()
+        print("EXECUTION -- the agent loop, step by step")
+        print("-" * 70)
+        agent = DEMO.LocationAgent(DEMO.DEFAULT_WEIGHTS, avoid_competition=avoid)
+        for t in tasks:
+            print("Step %2d: %s" % (t.step, t.description))
+            agent.run_step(t)
+            print()
+        memory.record(goal, cuisine, DEMO.DEFAULT_WEIGHTS, agent.best)
+        print("YOUR RECOMMENDATION:", agent.best)
+        if zipf not in ("all", "") and zipf in agent.areas:
+            ranked = sorted(agent.areas.values(), key=lambda x: (-x["total"], x["postal_code"]))
+            pos = next(i for i, a in enumerate(ranked, 1) if a["postal_code"] == zipf)
+            a = agent.areas[zipf]
+            print("YOUR SPOTLIGHT: %s ranked #%d of %d with total %.1f/100" % (zipf, pos, len(ranked), a["total"]))
+    return out.getvalue()
+
+PAGE = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>Restaurant Location Agent &mdash; Live Demo</title>\n<style>\n:root{\n  --bg:#0b1220; --bg2:#0e1626; --panel:#131e33; --panel2:#182742;\n  --ink:#eaf0f9; --muted:#9db0c9; --faint:#6b7f99;\n  --teal:#2dd4bf; --teal-dim:rgba(45,212,191,.12);\n  --accent:#5aa9ff; --warn:#fbbf24; --danger:#f87171; --ok:#34d399;\n  --line:#233451; --radius:14px;\n}\n*{box-sizing:border-box}\nbody{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;\n  background:var(--bg);color:var(--ink);line-height:1.6}\nheader{background:linear-gradient(135deg,#0a2540 0%,#0e3a5c 60%,#0b4f4a 100%);\n  padding:42px 32px 34px;border-bottom:1px solid var(--line)}\n.wrap{max-width:1060px;margin:0 auto}\nheader h1{margin:0 0 8px;font-size:30px;letter-spacing:-.01em}\nheader .sub{margin:0;color:#c8d6ea;font-size:16px;max-width:800px}\n.badge{display:inline-block;margin-top:14px;font-size:11.5px;letter-spacing:.1em;\n  text-transform:uppercase;color:#06281f;background:var(--teal);\n  padding:5px 14px;border-radius:999px;font-weight:800}\nmain{padding:8px 32px 48px}\nsection.card{background:var(--panel);border:1px solid var(--line);\n  border-radius:var(--radius);padding:26px 28px;margin:26px 0}\nsection.card h2{margin:0 0 12px;font-size:18px;color:var(--teal)}\nsection.card h2 .n{display:inline-block;width:28px;height:28px;border-radius:50%;\n  background:var(--teal-dim);border:1px solid var(--teal);color:var(--teal);\n  text-align:center;line-height:26px;font-size:14px;margin-right:10px}\nsection.card p{margin:0 0 12px;color:#d5e0f1;font-size:15.5px}\nsection.card p:last-child{margin-bottom:0}\n.watch{list-style:none;margin:6px 0 0;padding:0}\n.watch li{position:relative;padding:8px 0 8px 30px;color:#d5e0f1;font-size:15px;\n  border-bottom:1px dashed var(--line)}\n.watch li:last-child{border-bottom:0}\n.watch li::before{content:"\\25b8";position:absolute;left:8px;color:var(--teal);font-weight:700}\nlabel.f{display:block;margin:14px 0 6px;font-size:13px;font-weight:700;\n  letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}\ninput[type=text],input[type=number],select,textarea{\n  width:100%;background:var(--bg2);border:1px solid var(--line);color:var(--ink);\n  border-radius:10px;padding:11px 14px;font-size:15px;font-family:inherit}\ntextarea{min-height:76px;resize:vertical}\ninput:focus,select:focus,textarea:focus{outline:none;border-color:var(--teal)}\n.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n@media(max-width:700px){.row2{grid-template-columns:1fr}}\n.btnrow{display:flex;gap:14px;align-items:center;margin-top:20px;flex-wrap:wrap}\nbutton.run{background:linear-gradient(135deg,#14b8a6,#0d9488);border:0;\n  color:#04211c;font-weight:800;font-size:17px;padding:15px 34px;\n  border-radius:12px;cursor:pointer;box-shadow:0 6px 22px rgba(45,212,191,.25)}\nbutton.run:hover{filter:brightness(1.08)}\nbutton.run:disabled{opacity:.45;cursor:default;box-shadow:none}\nbutton.ghost{background:transparent;border:1px solid var(--teal);color:var(--teal);\n  font-weight:700;font-size:15px;padding:13px 26px;border-radius:12px;cursor:pointer}\nbutton.ghost:hover{background:var(--teal-dim)}\nbutton.ghost:disabled{opacity:.45;cursor:default}\n.hint{color:var(--muted);font-size:13.5px}\n.spinner{display:none;align-items:center;gap:10px;color:var(--muted);font-size:14px;margin-top:14px}\n.spinner.show{display:flex}\n.dot{width:12px;height:12px;border-radius:50%;background:var(--teal);\n  animation:pulse 1s infinite ease-in-out}\n@keyframes pulse{0%,100%{transform:scale(.6);opacity:.5}50%{transform:scale(1.2);opacity:1}}\n#output{display:none;margin-top:6px}\n#output.show{display:block}\n.out{background:#0a0f1c;border:1px solid var(--line);border-radius:12px;\n  padding:20px 22px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\n  font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;\n  max-height:640px;overflow:auto;color:#c9d6ea}\n.sechead{color:var(--accent);font-weight:800;margin:18px 0 2px;font-size:13.5px}\n.sechead:first-child{margin-top:0}\n.seccap{background:var(--teal-dim);border-left:3px solid var(--teal);\n  padding:8px 12px;margin:4px 0 12px;border-radius:0 8px 8px 0;\n  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;\n  font-size:13.5px;color:#bfe9e2}\n.tok-orch{color:var(--accent);font-weight:700}\n.tok-tool{color:var(--ok);font-weight:700}\n.tok-guard{color:var(--warn);font-weight:700}\n.tok-mem{color:#c084fc;font-weight:700}\n#takeaways{display:none}\n#takeaways.show{display:block}\n.take{background:rgba(52,211,153,.07);border:1px solid rgba(52,211,153,.4);\n  border-radius:var(--radius);padding:22px 26px;margin:26px 0}\n.take h2{color:var(--ok);margin:0 0 10px;font-size:18px}\n.take ul{margin:0;padding-left:20px}\n.take li{margin:8px 0;color:#d5e0f1;font-size:15px}\ntable.dec{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}\ntable.dec th{background:var(--panel2);color:var(--teal);text-align:left;\n  padding:10px 12px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;\n  border-bottom:1px solid var(--line)}\ntable.dec td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}\n.pill{display:inline-block;padding:3px 12px;border-radius:999px;font-weight:800;font-size:12px}\n.pill.v{background:var(--ok);color:#04281c}\n.pill.s{background:var(--faint);color:#0b1220}\nfooter{padding:26px 32px 40px;color:var(--faint);font-size:13.5px;text-align:center}\nfooter a{color:var(--teal);text-decoration:none}\nfooter a:hover{text-decoration:underline}\ndetails.raw{margin-top:14px}\ndetails.raw summary{cursor:pointer;color:var(--muted);font-size:13.5px}\n</style>\n</head>\n<body>\n<header><div class="wrap">\n  <h1>Restaurant Location Agent</h1>\n  <p class="sub">“Where exactly should I open my restaurant?” — answered with evidence, not gut feel.</p>\n  <span class="badge">DEMO 3 OF 8 · AGENTIC AI WORKSHOP</span>\n</div></header>\n<main><div class="wrap">\n\n<section class="card" id="story">\n  <h2><span class="n">1</span>The story</h2>\n  <p>Opening a restaurant is one of the riskiest small-business bets there is, and location decides most of it. Today that decision runs on gut feel and broker anecdotes.</p>\n<p>In this demo <b>you</b> play the restaurateur. The agent plans a 13-step investigation across 8 Phoenix ZIP codes, calls five evidence-gathering tools (review quality, competitors, economics, scoring, synthesis), scores every area on five factors, and recommends a ZIP with a plain-English explanation. Then the twist: you ask it to <i>avoid</i> competition instead — and it remembers your first query, inverts the competitor rule, and picks a different ZIP. Same agent, different memory-guided plan.</p>\n</section>\n\n<section class="card" id="watch">\n  <h2><span class="n">2</span>What to watch for</h2>\n  <ul class="watch">\n<li>Watch the planner decompose your question into 13 tool-calling steps <i>before</i> acting — planning first, tools second.</li>\n<li>Watch the per-factor scores: quality, economics, audience, competitor proximity, demand gap. No black box.</li>\n<li>In Turn 2, watch memory in action: the agent finds your first query, inverts the competitor rule, and changes its answer.</li>\n  </ul>\n</section>\n\n\n\n<section class="card" id="tryown">\n  <h2><span class="n">✎</span>Try your own</h2>\n  <p>Pick <b>your</b> cuisine, ZIP focus, and strategy — the planner and scoring engine re-run for you. Note: the sample dataset\'s competitor counts track Chinese restaurants, so for other cuisines the <i>process</i> is real while competitor counts stay approximate.</p>\n  <div class="row2">\n    <div><label class="f" for="r_cuisine">Your cuisine</label>\n      <select id="r_cuisine">\n        <option>Chinese</option><option>Italian</option><option>Mexican</option>\n        <option>Indian</option><option>Thai</option><option>American</option><option>Japanese</option>\n      </select></div>\n    <div><label class="f" for="r_zip">ZIP to spotlight</label>\n      <select id="r_zip">\n        <option value="all">All 8 Phoenix ZIPs</option>\n        <option>85003</option><option>85004</option><option>85006</option><option>85012</option>\n        <option>85015</option><option>85018</option><option>85020</option><option>85251</option>\n      </select></div>\n  </div>\n  <p class="hint" style="margin-top:10px">The engine scores all 8 areas so your spotlight ZIP is ranked against the rest.</p>\n  <label class="f" for="r_strat">Strategy</label>\n  <select id="r_strat">\n    <option value="near">Near competitors (Hotelling — foot traffic follows)</option>\n    <option value="avoid">Avoid heavy competition (blue-ocean ZIPs)</option>\n  </select>\n  <div class="btnrow">\n    <button class="ghost" id="customRun">Score it for me</button>\n    <span class="hint">Same inputs → same output. Deterministic.</span>\n  </div>\n  <div class="spinner" id="cspin"><div class="dot"></div>Planning and scoring…</div>\n</section>\n\n\n<section class="card" id="runbox">\n  <h2><span class="n">3</span>Run the demo</h2>\n  <p>Click below to run the full canned demonstration. It takes a few seconds.</p>\n  <div class="btnrow">\n    <button class="run" id="run">&#9654; Run live demo</button>\n  </div>\n  <div class="spinner" id="spin"><div class="dot"></div><span>The agent is investigating the 8 ZIP codes…</span></div>\n  <div id="output">\n    <div class="out" id="outtext"></div>\n    <details class="raw"><summary>Show raw terminal output</summary>\n      <div class="out" id="rawtext"></div>\n    </details>\n  </div>\n</section>\n\n<section class="card" id="takeaways" style="display:none">\n  <div class="take">\n    <h2>What just happened</h2>\n    <ul>\n<li>The recommendation came with receipts: five per-factor scores per ZIP, not a mysterious number.</li>\n<li>Competitor proximity is a feature, not just a threat — the Hotelling rule scores being near rivals positively (until you ask otherwise).</li>\n<li>Turn 2 proved memory: same engine, inverted rule, different ZIP — the agent adapts instead of repeating itself.</li>\n<li>Try your own: pick a cuisine, a ZIP focus, and a strategy in “Try your own” above.</li>\n    </ul>\n  </div>\n</section>\n\n</div></main>\n<footer><div class="wrap">\n  <a href="https://github.com/ynpreet/restaurant-location-agent" target="_blank" rel="noopener">View the project on GitHub</a>\n  &nbsp;&middot;&nbsp; All data in this demo is synthetic / fictional.\n</div></footer>\n\n<script>\nconst SECTIONS = [["TURN 1", "Your question: where to open a Chinese restaurant in Phoenix. The agent plans, then executes."], ["PLANNER", "The 13-step plan: fetch data per ZIP, analyze quality, competitors, economics \\u2014 then score and synthesize."], ["MEMORY", "What the agent remembers from past sessions \\u2014 consulted before planning, reused when relevant."], ["EXECUTION", "The agent loop, step by step: each tool call with its evidence, in the open."], ["TURN 2", "The follow-up: avoid heavy competition. Memory is consulted, the competitor rule is inverted, the answer changes."], ["DEMO COMPLETE", "End of run."]];\nfunction esc(s){return s.replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\');}\nfunction decorate(line){\n  let h = esc(line);\n  h = h.replace(/\\[ORCHESTRATOR\\]/g,\'<span class="tok-orch">[ORCHESTRATOR]</span>\');\n  h = h.replace(/\\[TOOL [^\\]]+\\]/g,function(m){return \'<span class="tok-tool">\'+m+\'</span>\';});\n  h = h.replace(/\\[MEMORY\\]/g,\'<span class="tok-mem">[MEMORY]</span>\');\n  h = h.replace(/GUARDRAIL/g,\'<span class="tok-guard">GUARDRAIL</span>\');\n  return h;\n}\nfunction renderOut(text){\n  document.getElementById(\'rawtext\').textContent = text;\n  const lines = text.split(\'\\n\');\n  let html = \'\';\n  for(const line of lines){\n    let matched = null;\n    for(const s of SECTIONS){ if(line.indexOf(s.m) !== -1){ matched = s; break; } }\n    if(matched){\n      html += \'<div class="sechead">\'+decorate(line)+\'</div>\'+\n              \'<div class="seccap">\'+matched.c+\'</div>\';\n      continue;\n    }\n    html += decorate(line) + \'\\n\';\n  }\n  document.getElementById(\'outtext\').innerHTML = html;\n  document.getElementById(\'output\').classList.add(\'show\');\n  document.getElementById(\'output\').scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\nfunction showTakeaways(){\n  const t = document.getElementById(\'takeaways\');\n  t.style.display=\'block\'; t.classList.add(\'show\');\n  t.scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\ndocument.getElementById(\'run\').addEventListener(\'click\',function(){\n  const btn=this, spin=document.getElementById(\'spin\');\n  btn.disabled=true; spin.classList.add(\'show\');\n  fetch(\'/api/run\').then(r=>r.json()).then(j=>{\n    spin.classList.remove(\'show\'); btn.disabled=false;\n    renderOut(j.output);\n    if(typeof loadDecisionTable===\'function\') loadDecisionTable();\n    showTakeaways();\n  }).catch(e=>{spin.classList.remove(\'show\');btn.disabled=false;alert(\'Run failed: \'+e);});\n});\n\nfunction collectCustom(){\n  return {cuisine:document.getElementById(\'r_cuisine\').value,\n          zip:document.getElementById(\'r_zip\').value,\n          strategy:document.getElementById(\'r_strat\').value};\n}\n\nfunction wireCustom(){\n  const b=document.getElementById(\'customRun\');\n  if(!b) return;\n  b.addEventListener(\'click\',function(){\n    const spin=document.getElementById(\'cspin\');\n    b.disabled=true; spin.classList.add(\'show\');\n    fetch(\'/api/custom\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n      body:JSON.stringify(collectCustom())})\n    .then(r=>r.json()).then(j=>{\n      spin.classList.remove(\'show\'); b.disabled=false;\n      if(j.error){alert(j.error);return;}\n      renderOut(j.output); showTakeaways();\n    }).catch(e=>{spin.classList.remove(\'show\');b.disabled=false;alert(\'Run failed: \'+e);});\n  });\n}\nwireCustom();\n</script>\n</body>\n</html>\n'
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "RestaurantLocationDemo/1.0"
+    server_version = "WorkshopUI/1.0"
 
-    def log_message(self, fmt, *args):
-        sys.stderr.write("  [http] %s\n" % (fmt % args))
+    def _send(self, body, ctype="text/html; charset=utf-8"):
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj):
+        self._send(json.dumps(obj), "application/json; charset=utf-8")
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8") or "{}")
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
-        if path == "/":
-            body = PAGE.encode("utf-8")
-            self._send(200, "text/html; charset=utf-8", body)
+        path = urllib.parse.urlsplit(self.path).path
+        if path in ("/", "/index.html"):
+            self._send(PAGE)
         elif path == "/api/run":
-            body = json.dumps(run_demo()).encode("utf-8")
-            self._send(200, "application/json; charset=utf-8", body)
+            self._json({"output": _capture_canned()})
         else:
-            body = b'{"ok": false, "error": "not found"}'
-            self._send(404, "application/json; charset=utf-8", body)
+            self.send_error(404, "not found")
 
-    def _send(self, code, content_type, body):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/custom":
+            params = self._read_json()
+            self._json({"output": _capture_fn(run_custom, params)})
+        else:
+            self.send_error(404, "not found")
 
-
-# ---------------------------------------------------------------------------
-# Single-page UI: inline CSS + JS, no external assets.
-# (raw string so the JavaScript backslashes pass through untouched)
-# ---------------------------------------------------------------------------
-PAGE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Restaurant Location Agent — Live Demo</title>
-<style>
-  :root {
-    --bg: #0f1420; --panel: #182031; --panel2: #1f2a42;
-    --ink: #eef2fa; --muted: #9aa7c2; --gold: #e8b44a;
-    --red: #d64541; --green: #4cc38a; --blue: #5aa2f0;
-    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-    line-height: 1.55;
-  }
-  .wrap { max-width: 1020px; margin: 0 auto; padding: 32px 20px 60px; }
-  header.hero {
-    background: linear-gradient(135deg, #23130f 0%, #4a1512 55%, #7a1f16 100%);
-    border: 1px solid #8a3a28; border-radius: 14px;
-    padding: 30px 32px; margin-bottom: 22px;
-  }
-  header.hero h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: 0.2px; }
-  header.hero h1 .badge {
-    display: inline-block; background: var(--gold); color: #23130f;
-    font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px;
-    vertical-align: middle; margin-right: 10px;
-  }
-  header.hero p.sub { margin: 0; color: #f3d9c6; font-size: 16px; }
-  .story {
-    background: var(--panel); border: 1px solid #2a3854; border-radius: 14px;
-    padding: 22px 26px; margin-bottom: 22px;
-  }
-  .story h2 { margin: 0 0 10px; font-size: 19px; color: var(--gold); }
-  .story p { margin: 8px 0; color: var(--ink); }
-  .story .rules { margin: 10px 0 0; padding-left: 20px; color: var(--muted); }
-  .story .rules li { margin: 4px 0; }
-  .story .rules b { color: var(--ink); }
-  .story .note {
-    margin-top: 12px; font-size: 13px; color: var(--muted);
-    border-top: 1px solid #2a3854; padding-top: 10px;
-  }
-  .controls { text-align: center; margin: 26px 0; }
-  button#runBtn {
-    background: var(--gold); color: #23130f; border: 0; border-radius: 10px;
-    font-size: 18px; font-weight: 700; padding: 14px 44px; cursor: pointer;
-    box-shadow: 0 4px 18px rgba(232,180,74,0.25);
-  }
-  button#runBtn:hover:not(:disabled) { background: #f3c46a; }
-  button#runBtn:disabled { opacity: 0.55; cursor: wait; }
-  .spinner {
-    display: inline-block; width: 18px; height: 18px; margin-right: 10px;
-    border: 3px solid rgba(35,19,15,0.25); border-top-color: #23130f;
-    border-radius: 50%; animation: spin 0.8s linear infinite;
-    vertical-align: -3px;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .status { text-align: center; color: var(--muted); font-size: 14px; min-height: 22px; }
-  .panel {
-    background: var(--panel); border: 1px solid #2a3854; border-radius: 14px;
-    padding: 22px 26px; margin-bottom: 22px;
-  }
-  .panel h2 { margin: 0 0 14px; font-size: 19px; }
-  .panel h2 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
-  #tracePanel h2 .dot { background: var(--blue); }
-  #resultsPanel h2 .dot { background: var(--green); }
-  .turn-label {
-    font-size: 15px; font-weight: 700; color: var(--ink);
-    margin: 18px 0 8px; padding-bottom: 6px; border-bottom: 1px solid #2a3854;
-  }
-  .turn-label:first-child { margin-top: 0; }
-  .plan-box {
-    background: #fff8e8; color: #3a2c12; border-left: 5px solid var(--gold);
-    border-radius: 8px; padding: 14px 18px; margin: 10px 0 16px;
-  }
-  .plan-box h3 { margin: 0 0 8px; font-size: 15px; color: #7a5b14; }
-  .plan-box ol { margin: 0; padding-left: 22px; font-size: 14px; }
-  .plan-box li { margin: 3px 0; }
-  .plan-box .tool { font-family: var(--mono); font-size: 12px; background: #efe3c2;
-    border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
-  .step-title { font-weight: 700; font-size: 14px; color: var(--ink); margin: 14px 0 6px; }
-  .toolcall {
-    font-family: var(--mono); font-size: 13px; background: var(--panel2);
-    border: 1px solid #33415e; border-left: 4px solid var(--blue);
-    border-radius: 6px; padding: 7px 12px; margin: 5px 0; color: #dbe5f5;
-    overflow-x: auto; white-space: pre-wrap; word-break: break-word;
-  }
-  .toolcall .tname { color: var(--gold); font-weight: 700; }
-  .mem {
-    font-size: 13px; color: var(--muted); background: #141b2c;
-    border-radius: 6px; padding: 8px 12px; margin: 8px 0;
-  }
-  .mem b { color: var(--blue); }
-  .rec-card {
-    background: linear-gradient(135deg, #123524 0%, #1a4a33 100%);
-    border: 1px solid #2e7d4f; border-radius: 10px;
-    padding: 18px 22px; margin: 12px 0 16px;
-  }
-  .rec-card .zip { font-size: 30px; font-weight: 800; color: #7ce3a8; }
-  .rec-card .area { font-size: 16px; color: var(--ink); }
-  .rec-card .score { font-size: 15px; color: var(--muted); margin-top: 4px; }
-  .rec-card .score b { color: var(--ink); }
-  .factors { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
-  .factors td { padding: 7px 10px; border-bottom: 1px solid #2a3854; }
-  .factors td:last-child { text-align: right; font-family: var(--mono); color: var(--gold); font-weight: 700; }
-  .why { font-size: 14px; color: #cdd7ec; margin: 12px 0; }
-  .why p { margin: 8px 0; }
-  .why p::before { content: "\2713  "; color: var(--green); font-weight: 700; }
-  .complete {
-    background: #123524; border: 1px solid #2e7d4f; border-radius: 10px;
-    padding: 14px 20px; margin-top: 18px; font-size: 14px; color: #bde8cd;
-  }
-  .error {
-    background: #3a1414; border: 1px solid var(--red); border-radius: 10px;
-    padding: 14px 20px; color: #f5c9c9; font-size: 14px;
-  }
-  .empty { color: var(--muted); font-size: 14px; }
-  footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 30px; }
-  code { font-family: var(--mono); background: #141b2c; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
-</style>
-</head>
-<body>
-<div class="wrap">
-
-  <header class="hero">
-    <h1><span class="badge">DEMO 2 OF 4</span>Restaurant Location Agent</h1>
-    <p class="sub">&ldquo;Where should I open a Chinese restaurant?&rdquo; — an agentic
-    site-selection system that <b>plans</b>, calls <b>tools</b>, <b>scores</b> every
-    candidate zip, and <b>synthesizes</b> a recommendation.</p>
-  </header>
-
-  <section class="story">
-    <h2>The story</h2>
-    <p>Opening a restaurant is one of the riskiest small-business bets there is —
-    location decides most of it. Instead of gut feel, we hand the problem to an
-    agent armed with <b>five business rules</b> a real restaurateur would use:</p>
-    <ol class="rules">
-      <li><b>Review-quality signals</b> — areas whose restaurants earn high stars and
-        whose Chinese-spot reviews mention &ldquo;fresh&rdquo; and &ldquo;authentic&rdquo;.</li>
-      <li><b>Produce/rent economics</b> — cheaper inputs and rent mean a good
-        restaurant costs less to run.</li>
-      <li><b>Customer/audience presence</b> — the cheapest lease means nothing with
-        no foot traffic.</li>
-      <li><b>Hotelling competitor-proximity</b> — a stall <i>beside</i> a competitor
-        usually outperforms an isolated one; the agent models a curve that peaks at
-        2&ndash;4 nearby Chinese restaurants and falls off with saturation.</li>
-      <li><b>Cuisine saturation vs. demand gap</b> — low Chinese share + strong demand
-        means an underserved gap.</li>
-    </ol>
-    <p>Watch the loop below: the agent prints its <b>PLAN</b> (13 steps), its
-    <b>tool calls</b> with real outputs, and the <b>Synthesizer&rsquo;s</b> ranked
-    recommendation. Turn 2 shows <b>memory</b>: asked to avoid competition, the
-    agent reuses the turn-1 scoring profile and replans with the inverted rule.</p>
-    <div class="note">Educational demo — all 60 businesses and reviews are synthetic
-    SAMPLE data in the Yelp schema (clearly labeled in the output). Offline, no API
-    keys, deterministic: identical output on every run.</div>
-  </section>
-
-  <div class="controls">
-    <button id="runBtn" type="button">Run live demo</button>
-  </div>
-  <div class="status" id="status"></div>
-
-  <section class="panel" id="tracePanel">
-    <h2><span class="dot"></span>Agent trace — plan &amp; execution</h2>
-    <div id="trace"><p class="empty">Press <b>Run live demo</b> to watch the agent
-    plan, call its tools, and score all 8 Phoenix-area zips.</p></div>
-  </section>
-
-  <section class="panel" id="resultsPanel">
-    <h2><span class="dot"></span>Results — recommendations</h2>
-    <div id="results"><p class="empty">The Synthesizer&rsquo;s ranked
-    recommendations will appear here.</p></div>
-  </section>
-
-  <footer>
-    Runs <code>python3 demo.py</code> live on this machine (localhost:8003) &middot;
-    stdlib only &middot; fully offline
-  </footer>
-
-</div>
-
-<script>
-(function () {
-  "use strict";
-  var btn = document.getElementById("runBtn");
-  var status = document.getElementById("status");
-  var traceEl = document.getElementById("trace");
-  var resultsEl = document.getElementById("results");
-
-  function esc(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-
-  btn.addEventListener("click", function () {
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span>Running the agent…';
-    status.textContent = "Running demo.py on the server — planning, tool calls, scoring…";
-    traceEl.innerHTML = "";
-    resultsEl.innerHTML = "";
-    fetch("/api/run")
-      .then(function (resp) { return resp.json(); })
-      .then(function (data) {
-        btn.disabled = false;
-        btn.textContent = "Run live demo";
-        if (!data.ok) {
-          status.textContent = "The demo failed.";
-          traceEl.innerHTML = '<div class="error">' + esc(data.error || "unknown error") + "</div>";
-          return;
-        }
-        status.textContent = "Demo complete — trace and results rendered below.";
-        render(data.output);
-      })
-      .catch(function (err) {
-        btn.disabled = false;
-        btn.textContent = "Run live demo";
-        status.textContent = "Request failed.";
-        traceEl.innerHTML = '<div class="error">Could not reach /api/run: ' + esc(String(err)) + "</div>";
-      });
-  });
-
-  function render(output) {
-    var lines = output.split("\n");
-    var traceHtml = [], resultsHtml = [];
-    var mode = "pre";            // pre | plan | exec | synth
-    var inPlanList = false;
-    var inWhy = false;
-    var whyLines = [];
-    var i, line;
-
-    function flushWhy() {
-      if (whyLines.length) {
-        resultsHtml.push('<div class="why">' +
-          whyLines.map(function (w) { return "<p>" + esc(w) + "</p>"; }).join("") +
-          "</div>");
-        whyLines = [];
-      }
-    }
-
-    for (i = 0; i < lines.length; i++) {
-      line = lines[i];
-      var t = line.trim();
-
-      if (/^=+\s*$/.test(t) || /^-{10,}\s*$/.test(t) || t === "") { continue; }
-
-      // ---- completion banner (check before synth mode swallows it) ----
-      if (/^DEMO COMPLETE/.test(t)) {
-        flushWhy();
-        var extra = ((lines[i + 1] || "") + " " + (lines[i + 2] || "")).trim();
-        resultsHtml.push('<div class="complete"><b>' + esc(t) + "</b><br>" + esc(extra) + "</div>");
-        i += 2;
-        continue;
-      }
-      if (/^agent used a plan/.test(t) || /^synthesizer across/.test(t)) { continue; }
-
-      // ---- turn header ----
-      var mTurn = line.match(/^TURN (.*?) — USER: (.*)$/);
-      if (mTurn) {
-        flushWhy(); mode = "pre"; inPlanList = false; inWhy = false;
-        traceHtml.push('<div class="turn-label">Turn: ' + esc(mTurn[1] + " — " + mTurn[2]) + "</div>");
-        resultsHtml.push('<div class="turn-label">' + esc(mTurn[1]) + "</div>");
-        continue;
-      }
-
-      // ---- plan section ----
-      if (/^PLANNER — plan of action/.test(t)) {
-        mode = "plan"; inPlanList = true;
-        var n = (t.match(/\((\d+) steps\)/) || [])[1] || "";
-        traceHtml.push('<div class="plan-box"><h3>PLAN — plan of action' +
-          (n ? " (" + n + " steps)" : "") + "</h3><ol>");
-        continue;
-      }
-      if (inPlanList) {
-        var mPlan = line.match(/^\s*Step\s+(\d+)\.\s+(.*?)\s+\[tool:\s*(.*?)\]\s*$/);
-        if (mPlan) {
-          traceHtml.push("<li><b>Step " + mPlan[1] + ".</b> " + esc(mPlan[2]) +
-            ' <span class="tool">' + esc(mPlan[3]) + "</span></li>");
-          continue;
-        }
-        traceHtml.push("</ol></div>");
-        inPlanList = false;
-      }
-
-      // ---- memory notes ----
-      if (/^MEMORY — /.test(t)) {
-        traceHtml.push('<div class="mem"><b>MEMORY</b> — ' + esc(t.replace(/^MEMORY — /, "")) + "</div>");
-        continue;
-      }
-      if (/\(cuisine:.*winner:/.test(t)) {
-        traceHtml.push('<div class="mem" style="margin-top:-4px">' + esc(t) + "</div>");
-        continue;
-      }
-
-      // ---- execution section ----
-      if (/^EXECUTION —/.test(t)) { mode = "exec"; continue; }
-      if (mode === "exec") {
-        var mStep = line.match(/^Step\s+(\d+):\s+(.*)$/);
-        if (mStep) {
-          traceHtml.push('<div class="step-title">Step ' + mStep[1] + ": " + esc(mStep[2]) + "</div>");
-          continue;
-        }
-        var mTool = line.match(/^\s*\[tool\]\s+(\w+)\((.*)\)\s*->\s*(.*)$/);
-        if (mTool) {
-          traceHtml.push('<div class="toolcall"><span class="tname">' + esc(mTool[1]) +
-            "</span>(" + esc(mTool[2]) + ") &rarr; " + esc(mTool[3]) + "</div>");
-          continue;
-        }
-      }
-
-      // ---- synthesizer ----
-      if (/^SYNTHESIZER —/.test(t)) { mode = "synth"; continue; }
-      if (mode === "synth") {
-        var mRec = t.match(/^RECOMMENDED:\s*(.*)$/);
-        if (mRec) {
-          var zip = mRec[1].split(" ")[0];
-          var area = mRec[1].slice(zip.length).trim();
-          resultsHtml.push('<div class="rec-card"><div class="zip">' + esc(zip) +
-            '</div><div class="area">' + esc(area) + "</div>");
-          continue;
-        }
-        var mScore = t.match(/^Score:\s*(.*)$/);
-        if (mScore) {
-          resultsHtml.push('<div class="score">Score: <b>' + esc(mScore[1]) + "</b></div></div>");
-          continue;
-        }
-        if (/^Per-factor scores for/.test(t)) {
-          resultsHtml.push('<table class="factors">');
-          continue;
-        }
-        var mFactor = t.match(/^(\d\.\s+.*?)\s{2,}(\d+\.\d+)\/100$/);
-        if (mFactor) {
-          resultsHtml.push("<tr><td>" + esc(mFactor[1]) + "</td><td>" +
-            esc(mFactor[2]) + "/100</td></tr>");
-          continue;
-        }
-        if (/^Why, in plain English:/.test(t)) { resultsHtml.push("</table>"); inWhy = true; continue; }
-        if (inWhy) {
-          if (/^(You asked to avoid|Review-quality signal|Economics|Customers|Hotelling|Saturation vs demand|Runner-up)/.test(t)) {
-            whyLines.push(t);
-          } else if (whyLines.length) {
-            whyLines[whyLines.length - 1] += " " + t;   // wrapped continuation line
-          }
-          continue;
-        }
-        continue;
-      }
-
-      // ---- skip demo banner / disclaimers (already on the page) ----
-      if (/^RESTAURANT LOCATION AGENT/.test(t) || /^NOTE: All business data/.test(t)) { continue; }
-    }
-    flushWhy();
-    traceEl.innerHTML = traceHtml.join("") || '<p class="empty">No trace captured.</p>';
-    resultsEl.innerHTML = resultsHtml.join("") || '<p class="empty">No results captured.</p>';
-  }
-})();
-</script>
-</body>
-</html>
-"""
+    def log_message(self, fmt, *args):
+        sys.stderr.write("ui: " + (fmt % args) + "\n")
 
 
 def main():
-    try:
-        server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
-    except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            sys.stderr.write("\n")
-            sys.stderr.write("ERROR: port %d is already in use.\n" % PORT)
-            sys.stderr.write(
-                "Something is already listening on http://localhost:%d "
-                "(maybe another copy of this demo).\n" % PORT)
-            sys.stderr.write(
-                "Fix: stop the other process (e.g. `pkill -f 'app.py'`), "
-                "then run `python3 app.py` again.\n\n")
-            sys.exit(1)
-        raise
-    print("=" * 60)
-    print("Restaurant Location Agent — live demo UI")
-    print()
-    print("Open in Chrome: http://localhost:8003")
-    print()
-    print("Serving on 127.0.0.1:%d — press Ctrl-C to stop." % PORT)
-    print("=" * 60)
-    sys.stdout.flush()
+    server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
+    print("Restaurant Location Agent demo UI -> http://localhost:8003")
+    print("Press Ctrl-C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
-    server.server_close()
+        print("\nstopped.")
 
 
 if __name__ == "__main__":
