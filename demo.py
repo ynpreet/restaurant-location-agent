@@ -28,6 +28,7 @@ identical bytes on every run.
 
 import hashlib
 import json
+import re
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
@@ -209,6 +210,92 @@ def is_chinese(b):
 
 
 # ---------------------------------------------------------------------------
+# Input honesty guards — the demo must not invent facts, silently assume
+# missing context, or pretend a recompute happened. These checks run before
+# planning and only add output for inputs outside the two canned turns, so
+# the canned demo's bytes are unchanged.
+# ---------------------------------------------------------------------------
+_KNOWN_CUISINES = ("chinese", "italian", "mexican", "indian", "thai",
+                   "american", "japanese", "vietnamese", "korean", "sushi",
+                   "vegetarian", "vegan", "pizza", "seafood", "french",
+                   "greek", "turkish", "bubble tea", "taco", "cantonese",
+                   "szechuan", "dim sum")
+_KNOWN_CITIES = ("phoenix", "tempe", "scottsdale", "mesa", "chandler",
+                 "gilbert", "glendale", "peoria", "arizona")
+_ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+[A-Za-z][\w.'-]*(?:\s+[A-Za-z][\w.'-]*){0,3}\s+"
+    r"(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|"
+    r"Way|Plaza|Court|Ct|Circle|Cir)\b")
+_AVOID_RE = re.compile(r"avoid[^.?!]{0,80}competit", re.IGNORECASE)
+
+
+def _detect_avoid_competition(goal):
+    """Infer the blue-ocean strategy from the goal text itself."""
+    g = goal.lower()
+    return bool(_AVOID_RE.search(goal)) or "blue ocean" in g \
+        or "quietest" in g
+
+
+def _asks_exact_live_facts(goal):
+    """True when the user demands exact, current, address-level facts."""
+    g = goal.lower()
+    return bool(_ADDRESS_RE.search(goal)) or \
+        ("exact" in g and "current" in g) or \
+        "do not use estimates" in g or "no estimates" in g
+
+
+def _refuse_exact_facts():
+    print()
+    print("UNABLE TO ANSWER AS ASKED")
+    print("-" * 70)
+    print("You asked for exact, current, address-level facts (rent dollars,")
+    print("foot-traffic counts, competitor counts at a specific street")
+    print("address). This demo cannot provide them:")
+    print("  - The dataset is SAMPLE (synthetic): ~60 invented businesses")
+    print("    across 8 Phoenix ZIPs — no street addresses exist in it.")
+    print("  - 'Rent' here is a relative index (1.00 = baseline), not dollars.")
+    print("  - 'Foot traffic' is a synthetic 0-100 proxy, not a live count.")
+    print("Giving you numbers would mean inventing them. To answer for a")
+    print("real address, point the agent at a real dataset (see README.md")
+    print("section 10, 'Point this at your real dataset').")
+
+
+def _missing_context_notes(goal, cuisine):
+    """Name context the goal left out so scoring never assumes silently."""
+    g = goal.lower()
+    notes = []
+    if not any(c in g for c in _KNOWN_CUISINES):
+        notes.append("no cuisine named — assuming '%s' (demo default; pass a "
+                     "different cuisine= to change it)" % cuisine)
+    if not (any(c in g for c in _KNOWN_CITIES)
+            or re.search(r"\bAZ\b", goal) or re.search(r"\b\d{5}\b", goal)):
+        notes.append("no city named — assuming Phoenix AZ (the demo dataset "
+                     "covers 8 Phoenix-area ZIPs)")
+    return notes
+
+
+def _cuisine_coverage_note(cuisine):
+    """Disclose what the sample dataset cannot measure for this cuisine."""
+    if cuisine.strip().lower() == "chinese":
+        return None
+    w = DEFAULT_WEIGHTS
+    return (
+        "DATA LIMITATIONS — the sample dataset labels competitors and "
+        "reviews for Chinese cuisine only, so for '%s':\n"
+        "  1. competitor counts and demand sentiment are NOT measured for "
+        "this cuisine — the engine reuses the Chinese-labeled evidence as "
+        "a structural stand-in;\n"
+        "  2. rent/produce are relative synthetic indexes (1.00 = baseline), "
+        "not dollar amounts;\n"
+        "  3. foot-traffic is a synthetic 0–100 proxy, not measured counts;\n"
+        "  4. no '%s'-specific demand signal exists in this sample.\n"
+        "Scoring weights — how each factor moves the ranking: quality %.2f, "
+        "economics %.2f, audience %.2f, hotelling %.2f, gap %.2f."
+        % (cuisine, cuisine, w["quality"], w["economics"], w["audience"],
+           w["hotelling"], w["gap"]))
+
+
+# ---------------------------------------------------------------------------
 # Agent memory — remembers past queries and reuses the scoring profile.
 # ---------------------------------------------------------------------------
 @dataclass
@@ -366,20 +453,29 @@ class Planner:
 # The agent loop — prints PLAN and every step so the loop is visible.
 # ---------------------------------------------------------------------------
 class LocationAgent:
-    def __init__(self, weights, avoid_competition=False):
+    def __init__(self, weights, avoid_competition=False, rent_shocks=None):
         self.weights = weights
         self.avoid_competition = avoid_competition
+        self.rent_shocks = rent_shocks or {}
         self.areas = {}
 
     def run_step(self, task):
         t = task.tool
         if t == "fetch_area_data":
             area = Tools.fetch_area_data(task.args[0])
+            shock = self.rent_shocks.get(area["postal_code"])
+            shock_note = ""
+            if shock:
+                old = area["rent_index"]
+                area["rent_index"] = round(old * shock, 4)
+                shock_note = ("; RENT SHOCK x%.2f: rent_index %.2f -> %.2f"
+                              % (shock, old, area["rent_index"]))
             self.areas[area["postal_code"]] = area
             a = area
             print("  [tool] fetch_area_data(%s) -> %s (%s): %d businesses, "
-                  "foot-traffic %d" % (a["postal_code"], a["area"], a["vibe"],
-                                       a["n_restaurants"], a["foot_traffic"]))
+                  "foot-traffic %d%s" % (a["postal_code"], a["area"], a["vibe"],
+                                         a["n_restaurants"],
+                                         a["foot_traffic"], shock_note))
         elif t in ("analyze_review_quality_all", "analyze_competitors_all",
                    "estimate_economics_all"):
             for z in sorted(self.areas):
@@ -528,11 +624,9 @@ def banner():
     print()
 
 
-def turn(goal, cuisine, memory, weights, avoid_competition=False,
-         label="TURN 1"):
-    print("=" * 70)
-    print("%s — USER: %s" % (label, goal))
-    print("=" * 70)
+def _run_pass(goal, cuisine, memory, weights, avoid, rent_shocks,
+              record):
+    """One full plan→execute→synthesize pass. Returns the LocationAgent."""
     planner = Planner()
     tasks, note = planner.plan(goal, ZIPS, memory, cuisine)
     print()
@@ -545,12 +639,83 @@ def turn(goal, cuisine, memory, weights, avoid_competition=False,
     print()
     print("EXECUTION — the agent loop, step by step")
     print("-" * 70)
-    agent = LocationAgent(weights, avoid_competition=avoid_competition)
+    agent = LocationAgent(weights, avoid_competition=avoid,
+                          rent_shocks=rent_shocks)
     for t in tasks:
         print("Step %2d: %s" % (t.step, t.description))
         agent.run_step(t)
         print()
-    memory.record(goal, cuisine, weights, agent.best)
+    if record:
+        memory.record(goal, cuisine, weights, agent.best)
+    return agent
+
+
+def _ranked(agent):
+    return sorted(agent.areas.values(),
+                  key=lambda x: (-x["total"], x["postal_code"]))
+
+
+def turn(goal, cuisine, memory, weights, avoid_competition=False,
+         label="TURN 1", rent_shock=None):
+    print("=" * 70)
+    print("%s — USER: %s" % (label, goal))
+    print("=" * 70)
+    # T3 guard: exact live facts at a street address — refuse, don't invent.
+    if _asks_exact_live_facts(goal):
+        _refuse_exact_facts()
+        return None
+    avoid = avoid_competition or _detect_avoid_competition(goal)
+    # T4 guard: state assumptions instead of scoring on silent defaults.
+    # A memory hit means this is a follow-up — context carries over.
+    if memory.consult(cuisine) is None:
+        missing = _missing_context_notes(goal, cuisine)
+        if missing:
+            print()
+            print("MISSING INFO — stating assumptions before scoring:")
+            for m in missing:
+                print("  - %s." % m)
+            print("  Re-ask naming a cuisine and city to change them.")
+    # T2 guard: disclose what the sample data cannot measure.
+    cov = _cuisine_coverage_note(cuisine)
+    if cov:
+        print()
+        print(cov)
+    agent = _run_pass(goal, cuisine, memory, weights, avoid, None, True)
+    # T5: genuine recompute — re-run with a rent shock on the winner,
+    # every other input unchanged, then report whether it still wins.
+    if rent_shock:
+        winner = agent.best
+        print()
+        print("=" * 70)
+        print("SENSITIVITY — re-running with rent x%.2f in %s (the "
+              "top-ranked ZIP); every other input unchanged"
+              % (rent_shock, winner))
+        print("=" * 70)
+        agent2 = _run_pass(goal, cuisine, memory, weights, avoid,
+                           {winner: rent_shock}, False)
+        r1, r2 = _ranked(agent), _ranked(agent2)
+        s1 = {a["postal_code"]: a for a in r1}
+        s2 = {a["postal_code"]: a for a in r2}
+        new_best = r2[0]["postal_code"]
+        print()
+        print("SENSITIVITY RESULT")
+        print("-" * 70)
+        print("  %s economics factor: %.1f -> %.1f (rent shock x%.2f)"
+              % (winner, s1[winner]["factors"]["economics"],
+                 s2[winner]["factors"]["economics"], rent_shock))
+        print("  %s total: %.1f -> %.1f"
+              % (winner, s1[winner]["total"], s2[winner]["total"]))
+        if new_best == winner:
+            print("  Recommendation UNCHANGED: %s still wins (margin over "
+                  "runner-up %s: %.1f -> %.1f points)."
+                  % (winner, r2[1]["postal_code"],
+                     r1[0]["total"] - r1[1]["total"],
+                     r2[0]["total"] - r2[1]["total"]))
+        else:
+            print("  Recommendation CHANGED: %s (%.1f) overtakes %s (%.1f)."
+                  % (new_best, s2[new_best]["total"], winner,
+                     s2[winner]["total"]))
+        return new_best
     return agent.best
 
 
